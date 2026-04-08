@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { X, Loader2, CheckCircle, AlertCircle, CreditCard } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import billingService, { formatCurrency } from '@/services/billingService';
@@ -6,8 +7,10 @@ import billingService, { formatCurrency } from '@/services/billingService';
 /**
  * Checkout Modal Component
  *
- * Handles checkout flow for both Stripe and Razorpay payment gateways.
- * Uses modal/overlay approach for seamless UX.
+ * For unauthenticated users (new signups): saves plan to localStorage and
+ * redirects to /register. OnboardingPage reads the plan back from localStorage.
+ *
+ * For authenticated users with an existing org: uses billingService as before.
  */
 export function CheckoutModal({
   isOpen,
@@ -16,15 +19,21 @@ export function CheckoutModal({
   billingPeriod = 'monthly',
   organization,
   onSuccess,
-  onCancel
+  onCancel,
+  // Pass isAuthenticated from parent if available; defaults to checking localStorage token
+  isAuthenticated,
 }) {
+  const navigate = useNavigate();
+
   const [isLoading, setIsLoading] = useState(false);
   const [checkoutData, setCheckoutData] = useState(null);
   const [error, setError] = useState(null);
   const [status, setStatus] = useState('idle'); // idle, loading, success, error
+  const [provider, setProvider] = useState('razorpay');
 
-  // Provider preference - can be 'stripe' or 'razorpay'
-  const [provider, setProvider] = useState('stripe');
+  // Determine if user is a new signup (no auth token present)
+  const userIsNew = isAuthenticated === false ||
+    (!isAuthenticated && !localStorage.getItem('token') && !localStorage.getItem('user'));
 
   // Reset state when modal opens
   useEffect(() => {
@@ -36,7 +45,37 @@ export function CheckoutModal({
     }
   }, [isOpen]);
 
-  // Initialize checkout when modal opens
+  // ─── NEW SIGNUP FLOW ────────────────────────────────────────────────────────
+  // Save plan to localStorage and redirect to /register
+  const handleNewSignupFlow = () => {
+    if (!plan) return;
+
+    const planPrice = billingPeriod === 'yearly'
+      ? (plan.yearlyPrice ?? plan.monthlyPrice ?? 0)
+      : (plan.monthlyPrice ?? 0);
+
+    const planToStore = {
+      id:           plan._id || plan.id,
+      _id:          plan._id || plan.id,
+      name:         plan.displayName || plan.name,
+      slug:         plan.slug,
+      tier:         plan.tier,
+      monthlyPrice: plan.monthlyPrice,
+      yearlyPrice:  plan.yearlyPrice,
+      price:        planPrice,
+      billingCycle: billingPeriod,
+      currency:     plan.currency,
+      limits:       plan.limits,
+      features:     plan.features,
+    };
+
+    // Persist across the register redirect
+    localStorage.setItem('selectedPlan', JSON.stringify(planToStore));
+    onClose?.();
+    navigate('/register');
+  };
+
+  // ─── EXISTING USER FLOW ─────────────────────────────────────────────────────
   const initializeCheckout = useCallback(async () => {
     if (!plan || !isOpen) return;
 
@@ -47,18 +86,14 @@ export function CheckoutModal({
       const result = await billingService.createCheckout({
         planId: plan._id || plan.id,
         billingPeriod,
-        provider
+        provider,
       });
 
       setCheckoutData(result.data);
 
       if (result.data.provider === 'stripe') {
-        // Redirect to Stripe checkout
-        if (result.data.url) {
-          window.location.href = result.data.url;
-        }
+        if (result.data.url) window.location.href = result.data.url;
       } else if (result.data.provider === 'razorpay') {
-        // Initialize Razorpay checkout
         initializeRazorpay(result.data);
       }
 
@@ -71,53 +106,43 @@ export function CheckoutModal({
     }
   }, [plan, billingPeriod, provider, isOpen]);
 
-  // Initialize Razorpay checkout
   const initializeRazorpay = (data) => {
-    // Check if Razorpay script is loaded
     if (!window.Razorpay) {
-      loadRazorpayScript().then(() => {
-        openRazorpayCheckout(data);
-      });
+      loadRazorpayScript().then(() => openRazorpayCheckout(data));
     } else {
       openRazorpayCheckout(data);
     }
   };
 
-  // Load Razorpay script
-  const loadRazorpayScript = () => {
-    return new Promise((resolve, reject) => {
+  const loadRazorpayScript = () =>
+    new Promise((resolve, reject) => {
       const script = document.createElement('script');
       script.src = 'https://checkout.razorpay.com/v1/checkout.js';
       script.onload = resolve;
       script.onerror = reject;
       document.body.appendChild(script);
     });
-  };
 
-  // Open Razorpay checkout
   const openRazorpayCheckout = (data) => {
     const options = {
-      key: data.keyId || import.meta.env.VITE_RAZORPAY_KEY_ID,
-      amount: data.amount,
-      currency: data.currency || 'INR',
-      name: organization?.name || 'Subscription',
+      key:         data.keyId || import.meta.env.VITE_RAZORPAY_KEY_ID,
+      amount:      data.amount,
+      currency:    data.currency || 'INR',
+      name:        organization?.name || 'Subscription',
       description: `${plan.name} - ${billingPeriod}ly`,
-      order_id: data.orderId,
+      order_id:    data.orderId,
       handler: async (response) => {
-        // Payment successful
         setStatus('success');
         onSuccess?.(response);
       },
       prefill: data.prefill || {},
-      theme: {
-        color: '#6366f1'
-      },
+      theme: { color: '#6366f1' },
       modal: {
         ondismiss: () => {
           setStatus('idle');
           onCancel?.();
-        }
-      }
+        },
+      },
     };
 
     const rzp = new window.Razorpay(options);
@@ -128,34 +153,23 @@ export function CheckoutModal({
     rzp.open();
   };
 
-  // Handle manual Stripe checkout
-  const handleStripeCheckout = () => {
-    initializeCheckout();
-  };
-
-  // Handle Razorpay checkout
-  const handleRazorpayCheckout = () => {
-    initializeCheckout();
-  };
+  const planPrice = billingPeriod === 'yearly' && plan?.yearlyPrice
+    ? plan.yearlyPrice
+    : plan?.monthlyPrice || 0;
 
   if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto">
       {/* Backdrop */}
-      <div
-        className="fixed inset-0 bg-black bg-opacity-50 transition-opacity"
-        onClick={onClose}
-      />
+      <div className="fixed inset-0 bg-black bg-opacity-50 transition-opacity" onClick={onClose} />
 
       {/* Modal */}
       <div className="flex min-h-full items-center justify-center p-4">
         <div className="relative w-full max-w-md transform rounded-2xl bg-white p-6 shadow-xl transition-all">
+
           {/* Close Button */}
-          <button
-            onClick={onClose}
-            className="absolute right-4 top-4 text-gray-400 hover:text-gray-500"
-          >
+          <button onClick={onClose} className="absolute right-4 top-4 text-gray-400 hover:text-gray-500">
             <X className="h-5 w-5" />
           </button>
 
@@ -166,12 +180,12 @@ export function CheckoutModal({
             </div>
             <h2 className="mt-4 text-xl font-semibold text-gray-900">
               {status === 'success' ? 'Payment Successful!' :
-               status === 'error' ? 'Payment Failed' :
+               status === 'error'   ? 'Payment Failed' :
                'Complete Your Subscription'}
             </h2>
             <p className="mt-2 text-sm text-gray-500">
               {status === 'success' ? 'Your subscription has been activated' :
-               status === 'error' ? 'There was an issue with your payment' :
+               status === 'error'   ? 'There was an issue with your payment' :
                `Subscribe to ${plan?.name} plan`}
             </p>
           </div>
@@ -188,103 +202,73 @@ export function CheckoutModal({
                 </div>
                 <div className="text-right">
                   <p className="text-lg font-bold text-gray-900">
-                    {formatCurrency(
-                      billingPeriod === 'yearly' && plan.yearlyPrice
-                        ? plan.yearlyPrice
-                        : plan.monthlyPrice,
-                      plan.currency?.code || 'USD'
-                    )}
+                    {formatCurrency(planPrice, plan.currency?.code || 'INR')}
                   </p>
                   {billingPeriod === 'yearly' && plan.yearlyDiscount > 0 && (
-                    <p className="text-xs text-green-600">
-                      Save {plan.yearlyDiscount}%
-                    </p>
+                    <p className="text-xs text-green-600">Save {plan.yearlyDiscount}%</p>
                   )}
                 </div>
               </div>
             </div>
           )}
 
-          {/* Provider Selection */}
-          {status === 'idle' && (
+          {/* NEW SIGNUP: show single CTA instead of payment provider picker */}
+          {status === 'idle' && userIsNew && (
+            <div className="mt-6">
+              <div className="rounded-lg bg-blue-50 border border-blue-200 p-4 mb-4">
+                <p className="text-sm text-blue-800">
+                  <strong>New here?</strong> Create your account first — your selected plan will be remembered and payment will be collected during signup.
+                </p>
+              </div>
+              <button
+                onClick={handleNewSignupFlow}
+                className="w-full rounded-lg bg-primary-600 py-3 font-semibold text-white hover:bg-primary-700 transition-all"
+              >
+                Continue to Sign Up →
+              </button>
+            </div>
+          )}
+
+          {/* EXISTING USER: show payment provider picker */}
+          {status === 'idle' && !userIsNew && (
             <div className="mt-6 space-y-4">
               <p className="text-sm font-medium text-gray-700">Select Payment Method</p>
-
               <div className="grid grid-cols-2 gap-3">
                 <button
                   onClick={() => setProvider('stripe')}
                   className={cn(
                     'flex items-center justify-center gap-2 rounded-lg border-2 p-3 transition-all',
-                    provider === 'stripe'
-                      ? 'border-primary-500 bg-primary-50'
-                      : 'border-gray-200 hover:border-gray-300'
+                    provider === 'stripe' ? 'border-primary-500 bg-primary-50' : 'border-gray-200 hover:border-gray-300'
                   )}
                 >
                   <svg className="h-6 w-8" viewBox="0 0 32 24" fill="none">
-                    <path
-                      d="M4 4a4 4 0 014-4h20a4 4 0 014 4v16a4 4 0 01-4 4H8a4 4 0 01-4-4V4z"
-                      fill="#635BFF"
-                    />
-                    <path
-                      d="M15.5 8.5c0-.828.672-1.5 1.5-1.5h2c.828 0 1.5.672 1.5 1.5v.5h-5v-.5z"
-                      fill="#fff"
-                    />
-                    <path
-                      d="M14 11a2 2 0 100 4h4a1 1 0 110 2h-5v2h5a2 2 0 100-4h-4a1 1 0 110-2h5V9h-5v2z"
-                      fill="#fff"
-                    />
+                    <path d="M4 4a4 4 0 014-4h20a4 4 0 014 4v16a4 4 0 01-4 4H8a4 4 0 01-4-4V4z" fill="#635BFF" />
+                    <path d="M15.5 8.5c0-.828.672-1.5 1.5-1.5h2c.828 0 1.5.672 1.5 1.5v.5h-5v-.5z" fill="#fff" />
+                    <path d="M14 11a2 2 0 100 4h4a1 1 0 110 2h-5v2h5a2 2 0 100-4h-4a1 1 0 110-2h5V9h-5v2z" fill="#fff" />
                   </svg>
                   <span className="font-medium">Credit Card</span>
                 </button>
-
                 <button
                   onClick={() => setProvider('razorpay')}
                   className={cn(
                     'flex items-center justify-center gap-2 rounded-lg border-2 p-3 transition-all',
-                    provider === 'razorpay'
-                      ? 'border-primary-500 bg-primary-50'
-                      : 'border-gray-200 hover:border-gray-300'
+                    provider === 'razorpay' ? 'border-primary-500 bg-primary-50' : 'border-gray-200 hover:border-gray-300'
                   )}
                 >
                   <svg className="h-6 w-6" viewBox="0 0 32 32" fill="none">
-                    <circle cx="16" cy="16" r="14" fill="#528FF0"/>
-                    <path d="M10 16l4 4 8-8" stroke="#fff" strokeWidth="2" strokeLinecap="round"/>
+                    <circle cx="16" cy="16" r="14" fill="#528FF0" />
+                    <path d="M10 16l4 4 8-8" stroke="#fff" strokeWidth="2" strokeLinecap="round" />
                   </svg>
                   <span className="font-medium">UPI/Netbanking</span>
                 </button>
               </div>
-            </div>
-          )}
 
-          {/* Error Message */}
-          {error && (
-            <div className="mt-4 flex items-center gap-2 rounded-lg bg-red-50 p-3 text-sm text-red-700">
-              <AlertCircle className="h-4 w-4 flex-shrink-0" />
-              {error}
-            </div>
-          )}
-
-          {/* Success Message */}
-          {status === 'success' && (
-            <div className="mt-6 flex items-center justify-center">
-              <div className="flex items-center gap-2 rounded-lg bg-green-50 p-3 text-sm text-green-700">
-                <CheckCircle className="h-4 w-4" />
-                Payment completed successfully
-              </div>
-            </div>
-          )}
-
-          {/* Actions */}
-          <div className="mt-6">
-            {status === 'idle' && (
               <button
                 onClick={initializeCheckout}
                 disabled={isLoading}
                 className={cn(
                   'w-full rounded-lg py-3 font-semibold text-white transition-all',
-                  isLoading
-                    ? 'bg-gray-300 cursor-not-allowed'
-                    : 'bg-primary-600 hover:bg-primary-700'
+                  isLoading ? 'bg-gray-300 cursor-not-allowed' : 'bg-primary-600 hover:bg-primary-700'
                 )}
               >
                 {isLoading ? (
@@ -293,42 +277,55 @@ export function CheckoutModal({
                     Processing...
                   </span>
                 ) : (
-                  `Pay ${formatCurrency(
-                    billingPeriod === 'yearly' && plan?.yearlyPrice
-                      ? plan.yearlyPrice
-                      : plan?.monthlyPrice || 0,
-                    plan?.currency?.code || 'USD'
-                  )}`
+                  `Pay ${formatCurrency(planPrice, plan?.currency?.code || 'INR')}`
                 )}
               </button>
-            )}
+            </div>
+          )}
 
-            {status === 'error' && (
-              <div className="flex gap-3">
-                <button
-                  onClick={onClose}
-                  className="flex-1 rounded-lg border border-gray-300 py-2 font-medium text-gray-700 hover:bg-gray-50"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={initializeCheckout}
-                  className="flex-1 rounded-lg bg-primary-600 py-2 font-medium text-white hover:bg-primary-700"
-                >
-                  Try Again
-                </button>
+          {/* Error */}
+          {error && (
+            <div className="mt-4 flex items-center gap-2 rounded-lg bg-red-50 p-3 text-sm text-red-700">
+              <AlertCircle className="h-4 w-4 flex-shrink-0" />
+              {error}
+            </div>
+          )}
+
+          {/* Success */}
+          {status === 'success' && (
+            <div className="mt-6 space-y-4">
+              <div className="flex items-center justify-center">
+                <div className="flex items-center gap-2 rounded-lg bg-green-50 p-3 text-sm text-green-700">
+                  <CheckCircle className="h-4 w-4" />
+                  Payment completed successfully
+                </div>
               </div>
-            )}
-
-            {status === 'success' && (
               <button
                 onClick={onClose}
                 className="w-full rounded-lg bg-green-600 py-3 font-semibold text-white hover:bg-green-700"
               >
                 Done
               </button>
-            )}
-          </div>
+            </div>
+          )}
+
+          {/* Retry on error */}
+          {status === 'error' && (
+            <div className="mt-4 flex gap-3">
+              <button
+                onClick={onClose}
+                className="flex-1 rounded-lg border border-gray-300 py-2 font-medium text-gray-700 hover:bg-gray-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={userIsNew ? handleNewSignupFlow : initializeCheckout}
+                className="flex-1 rounded-lg bg-primary-600 py-2 font-medium text-white hover:bg-primary-700"
+              >
+                Try Again
+              </button>
+            </div>
+          )}
 
           {/* Terms */}
           {status === 'idle' && (

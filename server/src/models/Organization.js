@@ -150,6 +150,12 @@ const organizationSchema = new mongoose.Schema({
     required: true
   },
 
+  // Latest payment reference
+  latestPaymentId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Payment'
+  },
+
   // Status
   isActive: {
     type: Boolean,
